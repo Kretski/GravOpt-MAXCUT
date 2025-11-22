@@ -1,3 +1,4 @@
+Update (22.11.2025):** New Numba test hits 0.3674 on G81 (20k nodes, 40k edges) in 1200 steps. GravOpt Pro (€200) launch delayed due to store activation – stay tuned! Run `python gravopt.py` to test.
 # GravOpt – Fast MAX-CUT Heuristic
 
 Single-file, pure Python+Numba MAX-CUT solver for sparse graphs (10k–200k+ nodes).
