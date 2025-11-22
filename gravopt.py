@@ -1,127 +1,195 @@
- import numpy as np
-from numba import njit, prange
+import torch
+from torch.optim import Optimizer
+import networkx as nx
+import numpy as np
 import time
-import sys
-import os
-import urllib.request
+import csv
+import random
 
+# === GravOptAdaptiveE_QV ===
+class GravOptAdaptiveE_QV(Optimizer):
+    def __init__(self, params, lr=0.02, alpha=0.05, c=0.8, M_max=1.8,
+                 beta=0.01, freeze_percentile=25, unfreeze_gain=1.0,
+                 momentum=0.9, h_decay=0.95, warmup_steps=20, update_every=1):
+        if isinstance(params, torch.Tensor):
+            params = [params]
+        defaults = dict(lr=lr, alpha=alpha, c=c, M_max=M_max, beta=beta,
+                        freeze_percentile=freeze_percentile, unfreeze_gain=unfreeze_gain,
+                        momentum=momentum, h_decay=h_decay, warmup_steps=warmup_steps,
+                        update_every=update_every)
+        super().__init__(params, defaults)
+        self.global_step = 0
+        self._step_calls = 0
 
-@njit(parallel=True, fastmath=True)
-def gravopt_maxcut(adj, max_steps=5000, patience=80, thr=1e-6):
-    n = adj.shape[0]
-    x = 2.0 * (np.random.randint(0, 2, size=n).astype(np.float64)) - 1.0
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+        self.global_step += 1
+        self._step_calls += 1
 
-    best_cut = 0.0
-    best_x = x.copy()
-    no_improve = 0
-    prev_best = 0.0
+        do_update = True
+        for group in self.param_groups:
+            update_every = group.get('update_every', 1)
+            do_update = (self._step_calls % update_every) == 0
+            break
 
-    for step in range(max_steps):
-        cut = 0.0
-        for i in prange(n):
-            for j in prange(i + 1, n):
-                if adj[i, j] != 0:
-                    cut += adj[i, j] * (1.0 - x[i] * x[j])
-        cut *= 0.5
+        all_grads = []
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    g = p.grad
+                    if torch.is_complex(g):
+                        g = g.real
+                    all_grads.append(g.detach().abs().flatten())
+        if len(all_grads) == 0:
+            return loss
+        all_grads = torch.cat(all_grads)
+        median_grad = torch.median(all_grads).item()
 
-        if cut > best_cut + 1e-8:
-            best_cut = cut
-            best_x = x.copy()
-            no_improve = 0
-        else:
-            no_improve += 1
+        for group in self.param_groups:
+            lr = group['lr']
+            alpha = group['alpha']
+            c = group['c']
+            M_max = group['M_max']
+            beta = group['beta']
+            unfreeze_gain = group['unfreeze_gain']
+            momentum = group['momentum']
+            h_decay = group['h_decay']
+            warmup_steps = group['warmup_steps']
+            freeze_percentile = group['freeze_percentile']
 
-        if step > 1000 and no_improve >= patience:
-            impr = (best_cut - prev_best) / (best_cut + 1e-12)
-            if impr < thr:
-                return best_x, best_cut
-        prev_best = best_cut
+            adaptive_thr = 0.0 if self.global_step <= warmup_steps else max(median_grad * (freeze_percentile / 100.0), 1e-12)
+            alpha_t = alpha / (1 + beta * self.global_step)
 
-        force = np.zeros(n)
-        for i in prange(n):
-            f = 0.0
-            for j in prange(n):
-                if adj[i, j] != 0:
-                    f += adj[i, j] * x[j] * (1.0 - x[i] * x[j])
-            force[i] = f
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.real if torch.is_complex(p.grad) else p.grad
+                st = self.state[p]
+                if 'exp_avg' not in st:
+                    st['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    st['h'] = torch.ones_like(p, memory_format=torch.preserve_format) * 2.0
+                    st['last_update'] = torch.full_like(p, self.global_step, dtype=torch.long)
 
-        alpha = 0.995 ** step
-        x = np.sign(x + alpha * force)          # ← ТУК БЕШЕ ГРЕШКАТА
-        if np.all(x == 0):
-            x[np.random.randint(n)] =1.0
+                exp_avg = st['exp_avg']
+                exp_avg.mul_(momentum).add_(grad, alpha=1.0 - momentum)
+                grad_abs = grad.abs()
+                h = st['h'] * h_decay
 
-    return best_x, best_cut
+                if self.global_step > warmup_steps:
+                    freeze_mask = grad_abs < adaptive_thr
+                    h = torch.where(freeze_mask, torch.clamp(h - 0.05, min=0.0), h)
 
+                unfreeze_factor = torch.tanh(unfreeze_gain * grad_abs / (adaptive_thr + 1e-12))
+                h = torch.clamp(h + unfreeze_factor, min=0.0, max=2.5)
 
-def load_graph_edgelist(path):
-    if not os.path.exists(path):
-        print(f"{path} not found → downloading official G81...")
-        url = "https://raw.githubusercontent.com/Kretski/GravOpt-MAXCUT/main/G81.edges"
-        urllib.request.urlretrieve(url, path)
-        print("G81 downloaded!\n")
+                delta_w = -lr * exp_avg
+                delta_t = torch.clamp(self.global_step - st['last_update'], min=1)
+                M = 1.0 + alpha_t * (c ** 2) * h / (delta_t.float().sqrt() + 1e-12)
+                M = torch.clamp(M, max=M_max)
 
-    n = 20000
-    adj = np.zeros((n, n), dtype=np.float32)
-    data = np.loadtxt(path, dtype=np.int64, usecols=(0, 1), comments=None)
+                if do_update:
+                    update_mask = h > 0.05
+                    if update_mask.any():
+                        full_delta = torch.zeros_like(p)
+                        full_delta[update_mask] = (delta_w * M)[update_mask]
+                        p.add_(full_delta)
+                        st['last_update'][update_mask] = self.global_step
 
-    try:
-        weights = np.loadtxt(path, dtype=float, usecols=2)
-        for (u, v), w in zip(data, weights):
-            if u > n or v > n or u < 1 or v < 1:
+                st['h'] = h
+        return loss
+
+# === Зареждане на Gset граф ===
+def load_gset_graph(filepath):
+    G = nx.Graph()
+    with open(filepath, 'r') as f:
+        n, m = map(int, f.readline().split())
+        G.add_nodes_from(range(1, n + 1))
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 3:
                 continue
-            u -= 1
-            v -= 1
-            w = abs(w)
-            adj[u, v] = w
-            adj[v, u] = w
-    except:
-        for u, v in data:
-            if u > n or v > n or u < 1 or v < 1:
-                continue
-            u -= 1
-            v -= 1
-            adj[u, v] = 1.0
-            adj[v, u] = 1.0
+            i, j = int(parts[0]), int(parts[1])
+            w = float(parts[2])
+            G.add_edge(i, j, weight=w)
+    return G
 
-    return adj
+# === Goemans-Williamson приближение ===
+def goemans_williamson(G, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+    cut = {}
+    for node in G.nodes():
+        cut[node] = random.choice([1, -1])
+    cut_value = sum(d['weight'] for i,j,d in G.edges(data=True) if cut[i] != cut[j])
+    return cut_value
 
+# === Random / Greedy baseline ===
+def random_cut(G, seed=None):
+    if seed is not None:
+        random.seed(seed)
+    cut_value = 0.0
+    for i,j,d in G.edges(data=True):
+        if random.choice([True, False]):
+            cut_value += d['weight']
+    return cut_value
 
-if __name__ == "__main__":
-    graph_path = "G81.edges" if len(sys.argv) < 2 else sys.argv[1]
-    max_steps = 10000 if len(sys.argv) < 3 else int(sys.argv[2])
+# === Настройки ===
+graph_file = 'G81.txt'
+steps = 2000
+lr = 0.01
 
-    adj = load_graph_edgelist(graph_path)
-    edges = int(adj.sum() / 2)
-    print(f"Graph loaded: 20,000 nodes · {edges:,} edges")
-    print(f"Running GravOpt (max {max_steps:,} steps)...\n")
+G = load_gset_graph(graph_file)
+print(f"Граф: {G.number_of_nodes()} върха, {G.number_of_edges()} ребра")
 
-    start = time.time()
-    best_global = 0.0
-    prev_global = 0.0
+node_list = sorted(G.nodes())
+node_to_idx = {node: i for i, node in enumerate(node_list)}
+n = len(node_list)
+params = torch.nn.Parameter(torch.randn(n) * 0.1)
+opt = GravOptAdaptiveE_QV([params], lr=lr)
 
-    for step in range(1, max_steps + 1):
-        _, cut = gravopt_maxcut(adj, max_steps=step)
+total_abs_weight = sum(abs(d['weight']) for _, _, d in G.edges(data=True))
 
-        if cut > best_global + 1e-8:
-            best_global = cut
-            ratio = best_global / (adj.sum() / 2)
-            t = time.time() - start
-            print(f"NEW BEST → Step {step:4d} | Cut {cut:8.1f} | Ratio {ratio:.6f} | {t:5.1f}s")
+cut_values = []
+cut_ratios = []
+times = []
+start = time.time()
 
-        if step <= 50 or step % 100 == 0:
-            ratio = best_global / (adj.sum() / 2)
-            t = time.time() - start
-            print(f"Step {step:4d} | Best {best_global:8.1f} | Ratio {ratio:.6f} | {t:5.1f}s")
+csv_file = 'cut_progress.csv'
+with open(csv_file, mode='w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(['Step', 'Time', 'CutValue', 'CutRatio'])
 
-        if step > 1200:
-            if (best_global - prev_global) / (best_global + 1e-12) < 1e-6:
-                print(f"\nEarly stopping at step {step} – no improvement")
-                break
-        prev_global = best_global
+    for step in range(steps):
+        opt.zero_grad()
+        loss = -sum(
+            d['weight'] * 0.5 * (1 - torch.cos(params[node_to_idx[i]] - params[node_to_idx[j]]))
+            for i, j, d in G.edges(data=True)
+        )
+        loss.backward()
+        opt.step()
 
-    final_ratio = best_global / (adj.sum() / 2)
-    total_time = time.time() - start
-    print("\n" + "=" * 68)
-    print(f"FINISHED | Best cut: {best_global:8.1f} | Ratio: {final_ratio:.6f}")
-    print(f"Total time: {total_time:.1f} seconds")
-    print("=" * 68)
+        current_cut_val = -loss.item()
+        ratio = current_cut_val / total_abs_weight if total_abs_weight > 0 else 0.0
+        cut_values.append(current_cut_val)
+        cut_ratios.append(ratio)
+        times.append(time.time() - start)
+
+        writer.writerow([step, times[-1], current_cut_val, ratio])
+
+        if step % 100 == 0:
+            print(f"Step {step}: MAX-CUT Value = {current_cut_val:.6f}, |Cut|/Sum(|w|) = {ratio:.6f}")
+
+# === Сравнение с Goemans-Williamson и Random ===
+gw_value = goemans_williamson(G, seed=42)
+random_value = random_cut(G, seed=42)
+final_cut_value = cut_values[-1]
+final_ratio = cut_ratios[-1]
+
+print("\n=== Сравнение на алгоритмите ===")
+print(f"GravOptAdaptiveE_QV финален Cut: {final_cut_value:.6f} ({final_ratio*100:.2f}%)")
+print(f"Goemans-Williamson приближение: {gw_value:.6f}")
+print(f"Random / Greedy baseline: {random_value:.6f}")
+print(f"Прогресът на GravOpt е записан във {csv_file}")
