@@ -1,4 +1,4 @@
-   import numpy as np
+ import numpy as np
 from numba import njit, prange
 import time
 import sys
@@ -46,9 +46,9 @@ def gravopt_maxcut(adj, max_steps=5000, patience=80, thr=1e-6):
             force[i] = f
 
         alpha = 0.995 ** step
-        x = np.sign(x + alpha * force)
+        x = np.sign(x + alpha * force)          # ← ТУК БЕШЕ ГРЕШКАТА
         if np.all(x == 0):
-            x[np.random.randint(n)] = 1.0
+            x[np.random.randint(n)] =1.0
 
     return best_x, best_cut
 
@@ -60,10 +60,8 @@ def load_graph_edgelist(path):
         urllib.request.urlretrieve(url, path)
         print("G81 downloaded!\n")
 
-    # Основният фикс – G81 винаги е 20 000 възела
     n = 20000
     adj = np.zeros((n, n), dtype=np.float32)
-
     data = np.loadtxt(path, dtype=np.int64, usecols=(0, 1), comments=None)
 
     try:
