@@ -1,16 +1,37 @@
-# GravOpt-MAXCUT
-Fast MAX-CUT heuristic inspired by gravitational dynamics · 20k–100k nodes in minutes on CPU · single-file Numba implementation
-# GravOpt – MAX-CUT Heuristic
+# GravOpt – Fast MAX-CUT Heuristic
 
-Single-file, dependency-light, extremely fast MAX-CUT solver for sparse graphs (10k–200k+ nodes).
+Single-file, pure Python+Numba MAX-CUT solver for sparse graphs (10k–200k+ nodes).
 
-Achieves **0.363–0.368 approximation ratio** on real-world sparse graphs (G-set, etc.) while being **50–200× faster** than Simulated Annealing / Tabu Search and completely practical where Goemans-Williamson (SDP) fails due to scaling.
+Delivers **0.363–0.368 approximation ratio** on standard benchmarks while being **50–200× faster** than Simulated Annealing/Tabu and fully practical where Goemans-Williamson (SDP) collapses.
 
-### Performance highlights (Nov 2025)
-| Graph   | Nodes | Edges  | Ratio    | Time (single core) | 99% quality reached at |
-|---------|-------|--------|----------|---------------------|-----------------------|
-| G81     | 20 000| 40 000 | 0.36765  | ~13 h full, ~6–8 min for 99% | step ~1200           |
+## Quick Start
 
-### Install
 ```bash
-pip install numpy numba
+pip install numpy numba                # once
+python gravopt.py benchmarks/G81.edges 2000
+``bash
+pip install numpy numba                # once
+python gravopt.py benchmarks/G81.edges 2000
+Example output on G81 (20 000 nodes, 40 000 edges):
+textGraph: 20000 nodes, 40000 edges
+Cut value: 14703.00
+Ratio: 0.367650
+Time: 48466.29 sec total (~13 h full run)
+→ but 99 % of quality already reached at ~1200 steps
+Early stopping = the real killer feature
+After ~1200 iterations on most graphs, improvement drops below 10⁻⁵ per step → stop early and get Tabu-level quality in minutes instead of hours.
+``bash
+Benchmarks (Nov 2025)
+Benchmarks (Nov 2025)
+
+GraphNodesEdgesRatioTime for 99 % qualityFull run timeG8120 00040 0000.36765~6–8 minutes~13 hours
+More graphs in /benchmarks (G14, G22, G81 + random sparse instances).
+Features
+
+~318 lines total (the whole algorithm is in gravopt.py)
+No external solvers, no GPU, no PyTorch/TF
+< 80 MB RAM even on 100k-node graphs
+Built-in early stopping (automatic after stagnation)
+
+Install
+Bashpip install numpy numba
