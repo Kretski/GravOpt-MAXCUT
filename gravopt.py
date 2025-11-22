@@ -8,8 +8,7 @@ import urllib.request
 @njit(parallel=True, fastmath=True)
 def gravopt_maxcut(adj, max_steps=5000, early_stop_steps=80, patience_thr=1e-6):
     n = adj.shape[0]
-    x = np.random.choice([-1.0, 1.0], size=n)
-
+     x = 2.0 * (np.random.randint(0, 2, size=n).astype(np.float64)) - 1.0
     best_cut = 0.0
     best_x = x.copy()
     no_improve_counter = 0
@@ -100,3 +99,4 @@ if __name__ == "__main__":
     print(f"Cut value: {cut:.2f}")
     print(f"Ratio: {ratio:.6f}")
     print(f"Time: {elapsed:.1f} seconds")
+
