@@ -1,1 +1,2 @@
 numpy\nnumba
+pip install nvidia-ml-py
